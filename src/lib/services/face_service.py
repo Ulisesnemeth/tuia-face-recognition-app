@@ -10,6 +10,14 @@ import torch
 import onnxruntime
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
+from lib.preprocess import (
+    FaceDetector,
+    align_face as align_face_with_kps,
+    crop_without_alignment,
+    iou as box_iou,
+    l2_normalize,
+    to_tensor,
+)
 import os 
 import logging
 
@@ -83,14 +91,24 @@ class FaceService:
     def _load_detector(self, detector_path: Path | None) -> any:
         """
         Load the face detector once (called from __init__).
-        By default loads a .pth / .onnx file from DETECTOR_MODEL_NAME, or returns None
-        when it is not set. Override it if your detector comes from a library
-        (InsightFace, OpenCV YuNet, MTCNN, etc.) and configure it with
-        self.det_score_threshold and self.det_input_size.
+
+        For the InsightFace SCRFD detector we do not use a raw onnxruntime
+        session: `insightface.model_zoo.get_model` builds the model with the
+        anchors/strides logic that turns raw outputs into boxes, scores and the
+        5 landmarks. That is why this override exists and why
+        DETECTOR_MODEL_NAME must point to det_10g.onnx (buffalo_l pack).
         """
         if detector_path is None:
+            logger.warning(
+                "DETECTOR_MODEL_NAME is not set: no detector will be available."
+            )
             return None
-        return self._load_model(detector_path)
+        return FaceDetector(
+            model_path=detector_path,
+            input_size=self.det_input_size,
+            score_threshold=self.det_score_threshold,
+            min_face_size=self.min_face_size,
+        )
 
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
@@ -113,8 +131,12 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
-
+        if self.detector is None:
+            raise RuntimeError(
+                "Detector not configured: set DETECTOR_MODEL_NAME to det_10g.onnx"
+            )
+        # FaceDetector already applies score threshold, minimum size and clipping.
+        return [face.bbox for face in self.detector.detect(image)]
 
     def align_face(
         self, image: np.ndarray, box: tuple[int, int, int, int]
@@ -123,14 +145,72 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        raise NotImplementedError("Not implemented")
+        if self.detector is None:
+            raise RuntimeError(
+                "Detector not configured: set DETECTOR_MODEL_NAME to det_10g.onnx"
+            )
+
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = box
+
+        # Re-detect to get landmarks and match the requested box by IoU.
+        faces = self.detector.detect(image)
+        target = max(faces, key=lambda f: box_iou(f.bbox, box), default=None)
+        kps = target.kps if target is not None else None
+        if target is None or kps is None or box_iou(target.bbox, box) < 0.3:
+            # Fallback: look for landmarks on a padded crop (small or partially
+            # occluded faces are sometimes missed in the full image).
+            margin = int(max(x2 - x1, y2 - y1) * self.align_margin)
+            cx1, cy1, cx2, cy2 = self._clip_xyxy(
+                x1 - margin, y1 - margin, x2 + margin, y2 + margin, height, width
+            )
+            crop = image[cy1:cy2, cx1:cx2]
+            crop_faces = self.detector.detect(crop) if crop.size > 0 else []
+            if crop_faces:
+                best = max(crop_faces, key=lambda f: f.score)
+                kps = best.kps + np.array([cx1, cy1], dtype=np.float32)
+
+        if kps is not None:
+            aligned = align_face_with_kps(image, kps, self.face_size)
+            # Keypoints must be relative to the top-left corner of the box:
+            # the frontend adds (x1, y1) back when drawing them.
+            relative_kps = (
+                np.asarray(kps, dtype=np.float32)
+                - np.array([x1, y1], dtype=np.float32)
+            )
+        else:
+            logger.warning("No landmarks for box %s: falling back to plain crop", box)
+            aligned = crop_without_alignment(image, box, self.face_size)
+            relative_kps = None
+
+        return AlignedFace(
+            bbox=list(box),
+            keypoints=relative_kps,
+            image=aligned,
+            embedding=None,
+        )
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        raise NotImplementedError("Not implemented")
+        # If the pipeline already computed it (e.g. a custom model), reuse it.
+        if getattr(face, "embedding", None) is not None:
+            embedding = np.asarray(face.embedding, dtype=np.float32)
+        elif isinstance(self.model, onnxruntime.InferenceSession):
+            tensor = to_tensor(face.image, self.face_size)
+            input_name = self.model.get_inputs()[0].name
+            embedding = self.model.run(None, {input_name: tensor})[0]
+        else:  # torch nn.Module
+            tensor = torch.from_numpy(to_tensor(face.image, self.face_size))
+            self.model.eval()
+            with torch.no_grad():
+                output = self.model(tensor)
+            embedding = output.detach().cpu().numpy()
+
+        embedding = l2_normalize(np.asarray(embedding, dtype=np.float32).ravel())
+        return embedding.astype(float).tolist()
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
