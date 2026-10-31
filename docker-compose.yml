@@ -14,7 +14,8 @@ services:
       - ./output:/app/output
       - ./data:/app/data
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     entrypoint: ["uvicorn", "app.main:app", "--reload", "--host", "0.0.0.0", "--port", "8000"]
   postgres:
     image: pgvector/pgvector:pg17
@@ -31,15 +32,8 @@ services:
       retries: 5
     volumes:
       - pgdata:/var/lib/postgresql/data
-    post_start:
-      - command:
-          - psql
-          - -U
-          - ${POSTGRES_USER:-faces_user}
-          - -d
-          - ${POSTGRES_DB:-faces}
-          - -c
-          - CREATE EXTENSION IF NOT EXISTS vector;
+    # La extension la crea el propio store (CREATE EXTENSION IF NOT EXISTS vector)
+    # cuando el backend conecta, una vez que el healthcheck esta en verde.
 
   frontend:
     build:
