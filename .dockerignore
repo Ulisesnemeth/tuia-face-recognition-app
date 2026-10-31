@@ -1,0 +1,17 @@
+# Contexto de build: nada de datos, pesos ni entornos locales.
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+models
+output
+data
+*.pth
+*.onnx
+*.ipynb_checkpoints
+README.md
+ENUNCIADO.md
+1-pre-processing.ipynb
+2-train.ipynb
